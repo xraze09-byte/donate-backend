@@ -1,0 +1,15 @@
+{
+  "name": "rz-clan-relay",
+  "version": "1.0.0",
+  "description": "Realtime WebSocket relay for RZ CLAN donation terminal — syncs donor submissions into the admin queue across devices.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "ws": "^8.21.3"
+  }
+}
