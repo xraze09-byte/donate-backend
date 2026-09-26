@@ -23,6 +23,10 @@ const RELAY_TOKEN = process.env.RELAY_TOKEN || '';
 const rooms = new Map();
 // room -> Map<donationId, message>  (backlog of NOT-yet-approved donations)
 const backlog = new Map();
+// room -> last payment config broadcast by the admin ({pp, payee, goal, min, reqSlip})
+// Sent to every NEW connection so donors who open the bare URL still get the
+// PromptPay number without needing the donate link or the admin being online.
+const cfgStore = new Map();
 const BACKLOG_TTL_MS = 24 * 60 * 60 * 1000; // 24h
 
 function getRoom(ch) {
@@ -74,6 +78,12 @@ wss.on('connection', (ws, req) => {
     try { ws.send(JSON.stringify(msg)); } catch (e) {}
   }
 
+  // Replay stored payment config so fresh donors get the PromptPay number.
+  const cfgMsg = cfgStore.get(ch);
+  if (cfgMsg) {
+    try { ws.send(JSON.stringify(cfgMsg)); } catch (e) {}
+  }
+
   ws.on('pong', () => { ws.isAlive = true; });
 
   ws.on('message', (raw) => {
@@ -87,6 +97,14 @@ wss.on('connection', (ws, req) => {
       getBacklog(ch).set(msg.d.rec.id, msg);
     } else if (msg.t === 'resolved' && msg.d && msg.d.id) {
       getBacklog(ch).delete(msg.d.id);
+    } else if (msg.t === 'cfg' && msg.d && typeof msg.d === 'object') {
+      // keep only donor-facing fields, never touch the channel key
+      const d = msg.d;
+      cfgStore.set(ch, { t: 'cfg', d: {
+        pp: String(d.pp || ''), payee: String(d.payee || ''),
+        goal: Number(d.goal) || 0, min: Number(d.min) || 0,
+        reqSlip: !!d.reqSlip
+      }});
     }
 
     // Relay to every OTHER client in the same room.
