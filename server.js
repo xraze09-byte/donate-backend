@@ -9,7 +9,6 @@
  * and replays a short backlog of pending donations to anyone who (re)connects.
  */
 const http = require('http');
-const crypto = require('crypto');
 const { WebSocketServer } = require('ws');
 
 const PORT = process.env.PORT || 8080;
@@ -27,7 +26,19 @@ const backlog = new Map();
 // Sent to every NEW connection so donors who open the bare URL still get the
 // PromptPay number without needing the donate link or the admin being online.
 const cfgStore = new Map();
+// room -> array of recent 'alert' messages (short-lived replay so an overlay that
+// drops/reconnects right when a donation gets approved doesn't permanently miss
+// that alert — unlike `donation` records, alerts were never backlogged before,
+// so a reconnect at the wrong instant silently dropped the voice/card announcement).
+const alertBacklog = new Map();
+const ALERT_TTL_MS = 2 * 60 * 1000;   // 2 min — long enough to survive a reconnect blip
+const ALERT_MAX = 8;                  // cap per room so it can't grow unbounded
+// room -> last activity timestamp, used to garbage-collect abandoned channels
+// (cfgStore/backlog/alertBacklog otherwise live forever in memory, even for
+// channels nobody has used in months — a slow leak on a long-running process).
+const lastSeen = new Map();
 const BACKLOG_TTL_MS = 24 * 60 * 60 * 1000; // 24h
+const ROOM_IDLE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days with zero traffic = abandoned
 
 function getRoom(ch) {
   if (!rooms.has(ch)) rooms.set(ch, new Set());
@@ -45,6 +56,25 @@ function pruneBacklog(ch) {
     if (now - (msg._at || 0) > BACKLOG_TTL_MS) b.delete(id);
   }
 }
+function pruneAlerts(ch) {
+  const arr = alertBacklog.get(ch);
+  if (!arr) return;
+  const now = Date.now();
+  while (arr.length && now - (arr[0]._at || 0) > ALERT_TTL_MS) arr.shift();
+  if (!arr.length) alertBacklog.delete(ch);
+}
+// Periodic sweep for channels with no connected clients and no traffic in a long
+// time — frees cfgStore/backlog/alertBacklog memory for streamers who stopped
+// using the app instead of holding it forever for the life of the process.
+setInterval(() => {
+  const now = Date.now();
+  for (const [ch, ts] of lastSeen) {
+    const hasPeers = rooms.has(ch) && rooms.get(ch).size > 0;
+    if (!hasPeers && now - ts > ROOM_IDLE_MS) {
+      backlog.delete(ch); cfgStore.delete(ch); alertBacklog.delete(ch); lastSeen.delete(ch);
+    }
+  }
+}, 60 * 60 * 1000);
 
 const server = http.createServer((req, res) => {
   if (req.url === '/health') {
@@ -56,7 +86,15 @@ const server = http.createServer((req, res) => {
   res.end('not found');
 });
 
-const wss = new WebSocketServer({ server, path: '/ws' });
+// จำกัดขนาดข้อความ — กันข้อความใหญ่ผิดปกติ (เช่น ส่ง base64 รูปเข้ามาผิด) ทำให้หน่วยความจำบวม
+const wss = new WebSocketServer({ server, path: '/ws', maxPayload: 64 * 1024 });
+
+// บัคร้ายแรง: เดิมไม่มี wss.on('error', ...) — ถ้า underlying server มีปัญหา (เช่น พอร์ตชน)
+// จะโยน exception ที่ไม่มีใครจับ แล้ว "ws" ไลบรารีก็ทำแบบเดียวกันกับทุก connection ที่ error
+// (ดูด้านล่างใน connection handler) ซึ่งจะทำให้ Node process ทั้งตัวล้ม กระทบทุกห้อง/ทุกสายที่แอดมิน
+// อยู่พร้อมกัน ไม่ใช่แค่ connection ที่เจอปัญหา — แก้โดย log แทนการปล่อยให้ throw
+wss.on('error', (err) => { console.error('wss error:', err && err.message); });
+server.on('error', (err) => { console.error('http server error:', err && err.message); });
 
 wss.on('connection', (ws, req) => {
   const url = new URL(req.url, 'http://x');
@@ -71,6 +109,17 @@ wss.on('connection', (ws, req) => {
   ws.ch = ch;
   ws.isAlive = true;
   getRoom(ch).add(ws);
+  lastSeen.set(ch, Date.now());
+
+  // บัคร้ายแรง (แก้แล้ว): 'ws' (จาก lib "ws") ยิง 'error' event ทุกครั้งที่ socket มีปัญหา
+  // ระดับ TCP/โปรโตคอล (เน็ตมือถือหลุด, เฟรมเสีย ฯลฯ) — ถ้าไม่มี listener จับไว้ Node.js จะ throw
+  // exception ที่ไม่มีใครจับ = process ทั้งตัวล่ม พา "ทุกห้อง ทุกสาย" ที่ต่ออยู่ตอนนั้นหลุดหมด
+  // ไม่ใช่แค่ client ที่มีปัญหา — เป็นสาเหตุที่เป็นไปได้สูงของอาการ "เซิร์ฟเวอร์ล่มเอง เงียบ ๆ
+  // โดเนทหยุดเข้าดื้อ ๆ" ตอนนี้แค่ log แล้วปิด socket นั้นทิ้งแทนที่จะปล่อยให้ล้มทั้ง process
+  ws.on('error', (err) => {
+    console.error('ws error on ch=' + ch + ':', err && err.message);
+    try { ws.terminate(); } catch (e) {}
+  });
 
   // Replay backlog (pending donations) so a reconnecting admin catches up.
   pruneBacklog(ch);
@@ -84,6 +133,13 @@ wss.on('connection', (ws, req) => {
     try { ws.send(JSON.stringify(cfgMsg)); } catch (e) {}
   }
 
+  // บัค (แก้แล้ว): เดิม 'alert' (การ์ด/เสียงอ่านโดเนท) ไม่ถูกเก็บ backlog เลย ต่างจาก
+  // 'donation' — ถ้า overlay (OBS) หลุดต่อกลับพอดีตอนแอดมินกดอนุมัติ จะพลาดอ่านยอดนั้นไปเลย
+  // ตลอดกาล ไม่มีทางกู้คืน ตอนนี้ replay alert ล่าสุดไม่กี่รายการ (ภายใน 2 นาที) ให้ด้วย
+  pruneAlerts(ch);
+  const alerts = alertBacklog.get(ch);
+  if (alerts) for (const msg of alerts) { try { ws.send(JSON.stringify(msg)); } catch (e) {} }
+
   ws.on('pong', () => { ws.isAlive = true; });
 
   ws.on('message', (raw) => {
@@ -91,12 +147,20 @@ wss.on('connection', (ws, req) => {
     try { msg = JSON.parse(raw.toString()); } catch (e) { return; }
     if (!msg || !msg.t) return;
     msg._at = Date.now();
+    lastSeen.set(ch, msg._at);
 
     // Track pending donations in the backlog; drop them once approved/rejected/deleted.
     if (msg.t === 'donation' && msg.d && msg.d.rec && msg.d.rec.id) {
       getBacklog(ch).set(msg.d.rec.id, msg);
     } else if (msg.t === 'resolved' && msg.d && msg.d.id) {
       getBacklog(ch).delete(msg.d.id);
+    } else if (msg.t === 'alert' && msg.d) {
+      // เก็บ alert ล่าสุดไว้สั้น ๆ เผื่อ overlay หลุดต่อกลับพอดีจังหวะที่ยิง alert นี้
+      pruneAlerts(ch);
+      if (!alertBacklog.has(ch)) alertBacklog.set(ch, []);
+      const arr = alertBacklog.get(ch);
+      arr.push(msg);
+      if (arr.length > ALERT_MAX) arr.shift();
     } else if (msg.t === 'cfg' && msg.d && typeof msg.d === 'object') {
       // keep only donor-facing fields, never touch the channel key
       const d = msg.d;
