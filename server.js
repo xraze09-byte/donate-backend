@@ -15,8 +15,13 @@ const PORT = process.env.PORT || 8080;
 // Optional shared secret. If set, clients must connect with ?tok=THIS_VALUE.
 // The channel key (`ch`) in the URL already acts as a capability secret
 // (it's the same "Overlay Secret Key" the HTML app generates), but RELAY_TOKEN
-// adds a second layer if you want it.
+// adds a second layer if you want it. Stays OPT-IN (unset by default) so this
+// deploy doesn't break unless you deliberately turn it on.
 const RELAY_TOKEN = process.env.RELAY_TOKEN || '';
+// Optional Origin allowlist, comma-separated (e.g. "https://your-app.vercel.app").
+// Also OPT-IN — unset means no restriction, same posture as RELAY_TOKEN.
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '')
+  .split(',').map((s) => s.trim()).filter(Boolean);
 
 // room (channel key) -> Set<ws>
 const rooms = new Map();
@@ -39,6 +44,13 @@ const ALERT_MAX = 8;                  // cap per room so it can't grow unbounded
 const lastSeen = new Map();
 const BACKLOG_TTL_MS = 24 * 60 * 60 * 1000; // 24h
 const ROOM_IDLE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days with zero traffic = abandoned
+
+// บัค (แก้แล้ว): เดิม `ch` ไม่ตรวจรูปแบบเลย และห้องไม่มีเพดานจำนวน — สคริปต์ที่เปิด
+// ?ch=<uuid สุ่ม> วนซ้ำ ๆ จะสร้าง Map entry ใหม่ทุกครั้ง (5 Map ต่อห้อง) จนหน่วยความจำเต็มได้
+// ตอนนี้ตรวจรูปแบบ + จำกัดจำนวนห้องทั้งหมด + จำนวนคนต่อห้อง (คีย์เดิมที่ใช้อยู่ยังผ่านได้ปกติ)
+const CH_RE = /^[A-Za-z0-9_-]{3,80}$/;
+const MAX_ROOMS = 500;
+const MAX_PEERS_PER_ROOM = 30;
 
 function getRoom(ch) {
   if (!rooms.has(ch)) rooms.set(ch, new Set());
@@ -66,7 +78,7 @@ function pruneAlerts(ch) {
 // Periodic sweep for channels with no connected clients and no traffic in a long
 // time — frees cfgStore/backlog/alertBacklog memory for streamers who stopped
 // using the app instead of holding it forever for the life of the process.
-setInterval(() => {
+const gcTimer = setInterval(() => {
   const now = Date.now();
   for (const [ch, ts] of lastSeen) {
     const hasPeers = rooms.has(ch) && rooms.get(ch).size > 0;
@@ -77,7 +89,7 @@ setInterval(() => {
 }, 60 * 60 * 1000);
 
 const server = http.createServer((req, res) => {
-  if (req.url === '/health') {
+  if (req.url === '/health' || req.url === '/') {
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ ok: true, rooms: rooms.size }));
     return;
@@ -86,8 +98,31 @@ const server = http.createServer((req, res) => {
   res.end('not found');
 });
 
-// จำกัดขนาดข้อความ — กันข้อความใหญ่ผิดปกติ (เช่น ส่ง base64 รูปเข้ามาผิด) ทำให้หน่วยความจำบวม
-const wss = new WebSocketServer({ server, path: '/ws', maxPayload: 64 * 1024 });
+// จำกัดขนาดข้อความ — 512KB พอให้สลิปโอนเงิน (base64 จากรูปภาพมือถือ ~200-800KB ก่อนบีบ) ผ่านได้
+// เดิม 64KB เตี้ยเกินไป ทุกสลิปที่แนบมาจะโดนตัดการเชื่อมต่อ (code 1009) แทนที่จะส่งถึงแอดมิน
+// ซึ่งอาการที่เห็นคือ "หลุดสุ่ม ๆ" ไม่ใช่ error ที่บอกสาเหตุตรง ๆ — เพิ่ม perMessageDeflate ช่วยลด
+// แบนด์วิดท์ของสลิป base64 ที่ตัวมันบีบได้ดี (ข้อความ JSON ทั่วไปก็ได้ประโยชน์ด้วย)
+const wss = new WebSocketServer({
+  server,
+  path: '/ws',
+  maxPayload: 512 * 1024,
+  perMessageDeflate: { threshold: 1024 },
+  verifyClient(info, cb) {
+    // บัค (แก้แล้ว): เดิมไม่เช็ค Origin เลย — ถ้าตั้ง ALLOWED_ORIGINS ไว้ (ยังเป็น opt-in
+    // เหมือน RELAY_TOKEN เพื่อไม่ให้ deploy นี้พังของเดิมทันทีถ้ายังไม่ได้ตั้งค่า) จะบล็อกได้
+    if (ALLOWED_ORIGINS.length) {
+      const origin = info.origin || '';
+      if (!ALLOWED_ORIGINS.includes(origin)) return cb(false, 403, 'bad origin');
+    }
+    let u;
+    try { u = new URL(info.req.url, 'http://x'); } catch (e) { return cb(false, 400, 'bad url'); }
+    const ch = u.searchParams.get('ch') || 'rzc_x';
+    if (!CH_RE.test(ch)) return cb(false, 400, 'bad channel');
+    if (!rooms.has(ch) && rooms.size >= MAX_ROOMS) return cb(false, 503, 'too many rooms');
+    if ((rooms.get(ch)?.size || 0) >= MAX_PEERS_PER_ROOM) return cb(false, 503, 'room full');
+    cb(true);
+  },
+});
 
 // บัคร้ายแรง: เดิมไม่มี wss.on('error', ...) — ถ้า underlying server มีปัญหา (เช่น พอร์ตชน)
 // จะโยน exception ที่ไม่มีใครจับ แล้ว "ws" ไลบรารีก็ทำแบบเดียวกันกับทุก connection ที่ error
@@ -95,6 +130,94 @@ const wss = new WebSocketServer({ server, path: '/ws', maxPayload: 64 * 1024 });
 // อยู่พร้อมกัน ไม่ใช่แค่ connection ที่เจอปัญหา — แก้โดย log แทนการปล่อยให้ throw
 wss.on('error', (err) => { console.error('wss error:', err && err.message); });
 server.on('error', (err) => { console.error('http server error:', err && err.message); });
+// บัค (แก้แล้ว): exception ที่หลุดจาก event handler อื่น ๆ (เช่น bug เล็ก ๆ ใน message handler)
+// ก็ทำให้ process ล่มได้เหมือนกันถ้าไม่มี guard เหล่านี้ — log แทนปล่อยให้ process ตาย
+process.on('unhandledRejection', (err) => { console.error('unhandledRejection:', err); });
+process.on('uncaughtException', (err) => { console.error('uncaughtException:', err); });
+
+// ── Rate limit: token bucket ต่อ connection (10 msg/s ต่อเนื่อง, burst 25) ──────────
+// เดิมไม่มีการจำกัดเลย — client เดียวส่งถี่แค่ไหนก็ได้ ทุกข้อความ JSON.stringify ซ้ำต่อ
+// ผู้ฟังทุกคนในห้อง (O(peers) ต่อข้อความ) ถ้าถูกยิงถี่มากพอ CPU จะอิ่มจน heartbeat พลาด
+// แล้วเซิร์ฟเวอร์เริ่มตัด connection ปกติทิ้งไปเอง
+const RATE_CAP = 25, RATE_REFILL = 10;
+function allow(ws) {
+  const now = Date.now();
+  ws._tok = Math.min(RATE_CAP, (ws._tok ?? RATE_CAP) + ((now - (ws._last ?? now)) / 1000) * RATE_REFILL);
+  ws._last = now;
+  if (ws._tok < 1) return false;
+  ws._tok -= 1;
+  return true;
+}
+
+// ── S-04: whitelist sanitizer — เดิม donation/alert/resolved ถูก relay ตรง ๆ ไม่ตรวจ
+// เลยแม้แต่ field เดียว (มีแค่ cfg ที่ sanitize) ทำให้ peer ที่รู้ ch ส่งอะไรก็ได้เข้าไปที่หน้า
+// จอแอดมิน/โอเวอร์เลย์ ซึ่ง render ด้วย innerHTML — เพิ่ม whitelist ที่ "รักษาทุก field ที่
+// หน้าเว็บใช้จริง" (ts/ref/status ที่ renderQueue ใช้เรียงคิว/แสดงวันที่ ฯลฯ) แค่บังคับ type/
+// ความยาว ไม่ใช่ตัดทิ้งแบบ snippet ตัวอย่างที่มาด้วย ซึ่งจะทำให้คิวแอดมินพังเพราะ ts/ref หายไป
+const clampStr = (v, n) => String(v == null ? '' : v).slice(0, n);
+// จำกัดความยาว base64 ของสลิปให้พอดีกับ maxPayload 512KB (เผื่อ overhead ของ JSON โครงสร้าง)
+const SLIP_RE = /^data:image\/(png|jpe?g|webp);base64,[A-Za-z0-9+/=]{1,600000}$/;
+const STATUSES = ['pending', 'approved', 'rejected'];
+
+function sanitizeRec(src) {
+  if (!src || typeof src !== 'object') return null;
+  const id = clampStr(src.id, 64);
+  if (!id) return null;
+  return {
+    id,
+    name: clampStr(src.name, 40) || 'ANONYMOUS',
+    message: clampStr(src.message, 200),
+    amount: Math.min(Math.max(Number(src.amount) || 0, 0), 1000000),
+    ts: Number(src.ts) || Date.now(),
+    ref: clampStr(src.ref, 32),
+    status: STATUSES.includes(src.status) ? src.status : 'pending',
+    slip: !!src.slip,
+  };
+}
+function sanitize(msg) {
+  const t = msg.t;
+  if (t === 'donation') {
+    const rec = sanitizeRec(msg.d && msg.d.rec);
+    if (!rec) return null;
+    const rawSlip = msg.d && msg.d.slip;
+    const slip = typeof rawSlip === 'string' && SLIP_RE.test(rawSlip) ? rawSlip : null;
+    return { t, _at: Date.now(), d: { rec, slip } };
+  }
+  if (t === 'alert') {
+    const src = msg.d;
+    if (!src || typeof src !== 'object') return null;
+    return {
+      t, _at: Date.now(),
+      d: {
+        name: clampStr(src.name, 40) || 'ANONYMOUS',
+        amount: Math.min(Math.max(Number(src.amount) || 0, 0), 1000000),
+        message: clampStr(src.message, 200),
+      },
+    };
+  }
+  if (t === 'resolved') {
+    const src = msg.d;
+    const id = clampStr(src && src.id, 64);
+    if (!id) return null;
+    return {
+      t, _at: Date.now(),
+      d: { id, status: ['approved', 'rejected'].includes(src.status) ? src.status : 'approved' },
+    };
+  }
+  if (t === 'cfg') {
+    const d = (msg.d && typeof msg.d === 'object') ? msg.d : {};
+    return {
+      t, _at: Date.now(),
+      d: {
+        pp: clampStr(d.pp, 20), payee: clampStr(d.payee, 25),
+        goal: Math.max(0, Number(d.goal) || 0), min: Math.max(0, Number(d.min) || 0),
+        reqSlip: !!d.reqSlip,
+      },
+    };
+  }
+  if (t === 'sync') return { t, _at: Date.now(), d: {} };
+  return null; // ไม่รู้จัก type นี้ — ไม่ relay
+}
 
 wss.on('connection', (ws, req) => {
   const url = new URL(req.url, 'http://x');
@@ -143,10 +266,17 @@ wss.on('connection', (ws, req) => {
   ws.on('pong', () => { ws.isAlive = true; });
 
   ws.on('message', (raw) => {
-    let msg;
-    try { msg = JSON.parse(raw.toString()); } catch (e) { return; }
-    if (!msg || !msg.t) return;
-    msg._at = Date.now();
+    if (!allow(ws)) {
+      if ((ws._strikes = (ws._strikes || 0) + 1) > 50) { try { ws.close(4008, 'rate limited'); } catch (e) {} }
+      return;
+    }
+    let parsed;
+    try { parsed = JSON.parse(raw.toString()); } catch (e) { return; }
+    if (!parsed || !parsed.t) return;
+
+    const msg = sanitize(parsed);
+    if (!msg) return;
+
     lastSeen.set(ch, msg._at);
 
     // Track pending donations in the backlog; drop them once approved/rejected/deleted.
@@ -161,21 +291,17 @@ wss.on('connection', (ws, req) => {
       const arr = alertBacklog.get(ch);
       arr.push(msg);
       if (arr.length > ALERT_MAX) arr.shift();
-    } else if (msg.t === 'cfg' && msg.d && typeof msg.d === 'object') {
-      // keep only donor-facing fields, never touch the channel key
-      const d = msg.d;
-      cfgStore.set(ch, { t: 'cfg', d: {
-        pp: String(d.pp || ''), payee: String(d.payee || ''),
-        goal: Number(d.goal) || 0, min: Number(d.min) || 0,
-        reqSlip: !!d.reqSlip
-      }});
+    } else if (msg.t === 'cfg') {
+      cfgStore.set(ch, msg);
     }
 
-    // Relay to every OTHER client in the same room.
+    // Relay to every OTHER client in the same room. Stringify once (S-05: avoid
+    // re-serializing the same message once per peer in a hot broadcast loop).
+    const frame = JSON.stringify(msg);
     const peers = getRoom(ch);
     for (const client of peers) {
       if (client !== ws && client.readyState === client.OPEN) {
-        try { client.send(JSON.stringify(msg)); } catch (e) {}
+        try { client.send(frame); } catch (e) {}
       }
     }
   });
@@ -204,6 +330,19 @@ const interval = setInterval(() => {
 }, HEARTBEAT_MS);
 
 wss.on('close', () => clearInterval(interval));
+
+// บัค (แก้แล้ว): เดิมไม่มี SIGTERM handler — Render ส่ง SIGTERM ทุกครั้งที่ deploy ใหม่/สเกล
+// ลง ทำให้ socket ทุกตัวหลุดแบบ abnormal close (1006) พร้อมกันหมด แทนที่จะได้ close frame
+// ปกติ (1001 "going away") ซึ่งฝั่ง client จะ reconnect พร้อมกันทันทีตอนที่ตัวเองยังบูตไม่เสร็จ
+function shutdown() {
+  clearInterval(interval);
+  clearInterval(gcTimer);
+  wss.clients.forEach((c) => { try { c.close(1001, 'server restarting'); } catch (e) {} });
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(0), 5000).unref();
+}
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);
 
 server.listen(PORT, () => {
   console.log(`RZ relay listening on :${PORT} (ws path /ws)`);
