@@ -324,14 +324,20 @@ async function handleTTS(req, res) {
     const key  = crypto.createHash('sha1').update(want + '|' + rate + '|' + text)
                        .digest('hex');
 
-    const send = (buf, src) => res.writeHead(200, {
+    // บั๊ก (แก้แล้ว): เดิม `res.writeHead(...) || res.end(buf)` — writeHead()
+    // คืนค่า truthy (this) เสมอ ทำให้ `||` ไม่เรียก res.end(buf) เลย — ส่ง header
+    // ไปแล้วแต่ response ไม่ปิดสักครั้ง = ค้างตลอดไปทุกครั้งที่ไม่ใช่ cache/diag
+    const send = (buf, src) => {
+      res.writeHead(200, {
         'Content-Type'               : 'audio/mpeg',
         'Content-Length'             : buf.length,
         'Cache-Control'              : 'public, max-age=86400, immutable',
         'Access-Control-Allow-Origin': '*',
         'X-TTS-Source'               : src,
         'X-TTS-Voice'                : pickVoice(text, want)   // ดีบักจาก DevTools
-      }) || res.end(buf);
+      });
+      res.end(buf);
+    };
 
     const hit = cacheGet(key);
     if (hit) return send(hit, 'cache');
