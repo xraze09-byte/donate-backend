@@ -10,6 +10,7 @@
  */
 const http = require('http');
 const { WebSocketServer } = require('ws');
+const { handleTTS, handleTTSHealth } = require('./tts');
 
 const PORT = process.env.PORT || 8080;
 // Optional shared secret. If set, clients must connect with ?tok=THIS_VALUE.
@@ -98,6 +99,10 @@ const server = http.createServer((req, res) => {
     res.end(JSON.stringify({ ok: true, rooms: rooms.size }));
     return;
   }
+  // TTS proxy (F-TTS-01): overlay ใน OBS ไม่มี speech engine เลย ต้องสังเคราะห์เสียงที่นี่
+  // แล้วส่ง MP3 กลับไปให้ overlay เล่นผ่าน <audio> — ดู tts.js สำหรับรายละเอียด
+  if (req.url.startsWith('/tts/health')) return handleTTSHealth(req, res);
+  if (req.url.startsWith('/tts')) return handleTTS(req, res);
   res.writeHead(404);
   res.end('not found');
 });
