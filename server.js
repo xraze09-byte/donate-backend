@@ -22,6 +22,10 @@ const RELAY_TOKEN = process.env.RELAY_TOKEN || '';
 // Also OPT-IN — unset means no restriction, same posture as RELAY_TOKEN.
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '')
   .split(',').map((s) => s.trim()).filter(Boolean);
+// เปิด ALLOWED_ORIGINS ไว้ก่อนแบบ "แค่ log ไม่บล็อกจริง" (ENFORCE_ORIGIN ยังไม่ตั้ง = 0) เพื่อดู
+// ของจริงว่ามี Origin อะไรมาเชื่อมต่อบ้างก่อนบังคับ — กันเคสเดามั่ว/ลืมโดเมนที่ใช้จริงบางตัว
+// (เช่น OBS ที่โหลดไฟล์ .html ตรง ๆ จะส่ง Origin เป็น null/file:// ไม่ใช่โดเมนเว็บ)
+const ENFORCE_ORIGIN = process.env.ENFORCE_ORIGIN === '1';
 
 // room (channel key) -> Set<ws>
 const rooms = new Map();
@@ -111,8 +115,12 @@ const wss = new WebSocketServer({
     // บัค (แก้แล้ว): เดิมไม่เช็ค Origin เลย — ถ้าตั้ง ALLOWED_ORIGINS ไว้ (ยังเป็น opt-in
     // เหมือน RELAY_TOKEN เพื่อไม่ให้ deploy นี้พังของเดิมทันทีถ้ายังไม่ได้ตั้งค่า) จะบล็อกได้
     if (ALLOWED_ORIGINS.length) {
-      const origin = info.origin || '';
-      if (!ALLOWED_ORIGINS.includes(origin)) return cb(false, 403, 'bad origin');
+      const origin = info.origin || 'null';
+      const originOk = ALLOWED_ORIGINS.includes(origin);
+      if (!originOk) {
+        console.warn(`[origin] ${ENFORCE_ORIGIN ? 'BLOCKED' : 'WOULD-BLOCK (dry-run, set ENFORCE_ORIGIN=1 to actually block)'}: ${origin}`);
+        if (ENFORCE_ORIGIN) return cb(false, 403, 'bad origin');
+      }
     }
     let u;
     try { u = new URL(info.req.url, 'http://x'); } catch (e) { return cb(false, 400, 'bad url'); }
@@ -158,6 +166,9 @@ const clampStr = (v, n) => String(v == null ? '' : v).slice(0, n);
 // จำกัดความยาว base64 ของสลิปให้พอดีกับ maxPayload 512KB (เผื่อ overhead ของ JSON โครงสร้าง)
 const SLIP_RE = /^data:image\/(png|jpe?g|webp);base64,[A-Za-z0-9+/=]{1,600000}$/;
 const STATUSES = ['pending', 'approved', 'rejected'];
+// alert/cfg/resolved ควรมาจาก "แอดมิน" เท่านั้น — donation/sync มาจากใครก็ได้ (โดนอร์)
+const ADMIN_TYPES = new Set(['alert', 'cfg', 'resolved']);
+const PUBLIC_TYPES = new Set(['donation', 'sync']);
 
 function sanitizeRec(src) {
   if (!src || typeof src !== 'object') return null;
@@ -170,8 +181,13 @@ function sanitizeRec(src) {
     amount: Math.min(Math.max(Number(src.amount) || 0, 0), 1000000),
     ts: Number(src.ts) || Date.now(),
     ref: clampStr(src.ref, 32),
-    status: STATUSES.includes(src.status) ? src.status : 'pending',
+    // บัคเพิ่ม (พบระหว่างแก้ S-04): เดิม sanitizer ยอม client อ้าง status:'approved' มาตรงๆ
+    // ใน 'donation' message ได้เลย — ทั้งที่ทุก path ที่ถูกต้องของแอปสร้าง donation ใหม่เป็น
+    // 'pending' เสมอ (การอนุมัติจริงมาจาก 'resolved' type เท่านั้น) เท่ากับใครก็ประกาศยอด
+    // ตัวเองว่า "อนุมัติแล้ว" ได้เลยโดยไม่ผ่านแอดมิน — บังคับเป็น pending เสมอตรงนี้แทน
+    status: 'pending',
     slip: !!src.slip,
+    sha: clampStr(src.sha, 64), // F-06: แฮชสลิปไว้เทียบซ้ำ
   };
 }
 function sanitize(msg) {
@@ -229,6 +245,16 @@ wss.on('connection', (ws, req) => {
     return;
   }
 
+  // ── Capability scope (ปิดช่องโหว่ F-01 ที่ราก): เดิม `ch` (channel key) เป็นความลับเดียว
+  // ที่ป้องกันทั้งระบบ แต่มันถูกฝังอยู่ในไฟล์ HTML สาธารณะ (View Source เห็นได้ทันที) — ใครมี ch
+  // ก็ส่ง alert/cfg/resolved ปลอมขึ้นจอสตรีมได้เหมือนเป็นแอดมิน
+  // ตอนนี้ยังไม่ "บังคับ" (ยังไม่ตั้งค่า RELAY_TOKEN = สถานะเดิมทุกอย่าง 100%, ทุก connection
+  // ได้ scope 'admin' เหมือนกันหมด ไม่มีอะไรถูกบล็อก) — ต่อเมื่อคุณตั้ง RELAY_TOKEN บน Render
+  // และให้เฉพาะแอดมินที่ล็อกอินแล้วส่ง ?tok= ที่ตรงกัน (ผ่าน CFG.token ที่เพิ่มไว้ใน index.html
+  // แล้ว) เท่านั้นที่จะได้ scope 'admin' จริง — คนอื่นที่มีแค่ ch จะได้ 'public' ส่งได้แค่
+  // donation/sync เท่านั้น ปลอม alert/cfg/resolved ไม่ได้อีกต่อไป
+  ws._scope = (!RELAY_TOKEN || tok === RELAY_TOKEN) ? 'admin' : 'public';
+
   ws.ch = ch;
   ws.isAlive = true;
   getRoom(ch).add(ws);
@@ -276,6 +302,10 @@ wss.on('connection', (ws, req) => {
 
     const msg = sanitize(parsed);
     if (!msg) return;
+
+    // Capability scope enforcement — no-op today while RELAY_TOKEN is unset (see above).
+    if (ADMIN_TYPES.has(msg.t) && ws._scope !== 'admin') return; // drop เงียบ ไม่ relay ไม่ backlog
+    if (!ADMIN_TYPES.has(msg.t) && !PUBLIC_TYPES.has(msg.t)) return;
 
     lastSeen.set(ch, msg._at);
 
@@ -343,6 +373,14 @@ function shutdown() {
 }
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
+
+if (!RELAY_TOKEN) {
+  console.warn('==================================================================');
+  console.warn('  RELAY_TOKEN ยังไม่ได้ตั้งค่า — ทุก connection ได้สิทธิ์ admin เท่ากันหมด');
+  console.warn('  (ใครที่รู้ channel key ก็ยังส่ง alert/cfg ปลอมได้เหมือนเดิม)');
+  console.warn('  ตั้ง RELAY_TOKEN บน Render + CFG.token ในแอดมินเพื่อปิดช่องนี้จริง');
+  console.warn('==================================================================');
+}
 
 server.listen(PORT, () => {
   console.log(`RZ relay listening on :${PORT} (ws path /ws)`);
