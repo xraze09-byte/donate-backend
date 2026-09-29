@@ -71,6 +71,15 @@ const kids=[];process.on('exit',()=>kids.forEach(k=>{try{k.kill()}catch(e){}}));
  const l2=got(lis,'donation').find(m=>m.d.rec.id==='Y2');
  ok(l2&&!l2.d.slip,'listener never receives slip image');
  ok(got(adm,'donation').find(m=>m.d.rec.id==='Y2').d.slip,'admin still receives slip image');
+ // regression: a 2nd donor re-using a pending donation id must NOT overwrite the first one
+ send(pub,{t:'donation',d:{rec:{id:'Z1',name:'Real',amount:500,q:{name:'RealFF',uid:'111111111'}}}});await sleep(150);
+ const pub2=await conn(9302,`ch=${CH}`);
+ send(pub2,{t:'donation',d:{rec:{id:'Z1',name:'Evil',amount:1,q:{name:'EvilFF',uid:'222222222'}}}});await sleep(150);
+ ok(got(adm,'donation').filter(m=>m.d.rec.id==='Z1').length===1,'duplicate pending id is not relayed again');
+ send(adm,{t:'resolved',d:{id:'Z1',status:'approved'}});await sleep(200);
+ const rz=got(lis,'resolved').find(m=>m.d.id==='Z1');
+ ok(rz&&rz.d.amount===500&&rz.d.q&&rz.d.q.uid==='111111111','id collision: approval keeps the ORIGINAL donor amount + UID');
+ pub2.close();
  ok(!/uncaught/i.test(s.log()),'no uncaught exceptions');
  [adm,lis,pub].forEach(w=>w.close());s.kill();await sleep(200);
 

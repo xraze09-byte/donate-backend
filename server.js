@@ -338,6 +338,11 @@ wss.on('connection', (ws, req) => {
 
     // Track pending donations in the backlog; drop them once approved/rejected/deleted.
     if (msg.t === 'donation' && msg.d && msg.d.rec && msg.d.rec.id) {
+      // บัค (แก้แล้ว): เดิม .set() ทับ id เดิมได้ — ผู้บริจาคคนที่สองส่ง id ซ้ำกับรายการที่ยังรออนุมัติ
+      // จะเขียนทับ name/amount/q ของคนแรกใน backlog แอดมินกดอนุมัติรายการจริง (เช่น 500฿)
+      // แต่ 'resolved' จะแนบ q/amount ของคนร้าย (เช่น 1฿ + UID ของเขา) ไปให้ bridge สร้างคิวผิดคน
+      // ตอนนี้ id ที่มีอยู่แล้วใน backlog ห้ามทับ (รายการแรกชนะ) และไม่ relay รายการซ้ำต่อ
+      if (getBacklog(ch).has(msg.d.rec.id)) return;
       getBacklog(ch).set(msg.d.rec.id, msg);
     } else if (msg.t === 'resolved' && msg.d && msg.d.id) {
       // แนบ q + amount จากรายการที่เก็บไว้ (เชื่อถือได้กว่าที่ client ส่งมา) ให้ bridge ใช้สร้างคิว
