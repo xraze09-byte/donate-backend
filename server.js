@@ -19,6 +19,11 @@ const PORT = process.env.PORT || 8080;
 // adds a second layer if you want it. Stays OPT-IN (unset by default) so this
 // deploy doesn't break unless you deliberately turn it on.
 const RELAY_TOKEN = process.env.RELAY_TOKEN || '';
+// Read-only token for the separate queue service (bridge.js). A connection with this token
+// gets scope 'listener': it RECEIVES everything the room broadcasts (minus slip images) but
+// every message it sends is dropped. Leaking it lets an attacker read pending donations, never
+// forge alerts/approvals. MUST differ from RELAY_TOKEN. Unset = feature off (zero behaviour change).
+const LISTEN_TOKEN = process.env.LISTEN_TOKEN || '';
 // Optional Origin allowlist, comma-separated (e.g. "https://your-app.vercel.app").
 // Also OPT-IN — unset means no restriction, same posture as RELAY_TOKEN.
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '')
@@ -175,6 +180,16 @@ const STATUSES = ['pending', 'approved', 'rejected'];
 const ADMIN_TYPES = new Set(['alert', 'cfg', 'resolved']);
 const PUBLIC_TYPES = new Set(['donation', 'sync']);
 
+// q = optional queue request attached by the donate form: { name, uid }. uid must be a Free Fire
+// UID (6-14 digits, same rule as Queue-system/queue.js). Anything malformed is DROPPED (the
+// donation itself still goes through untouched) - a bad q must never block a payment.
+function sanitizeQ(q) {
+  if (!q || typeof q !== 'object') return undefined;
+  const uid = String(q.uid == null ? '' : q.uid).replace(/\D/g, '');
+  if (!/^\d{6,14}$/.test(uid)) return undefined;
+  return { name: clampStr(q.name, 24), uid };
+}
+
 function sanitizeRec(src) {
   if (!src || typeof src !== 'object') return null;
   const id = clampStr(src.id, 64);
@@ -193,6 +208,7 @@ function sanitizeRec(src) {
     status: 'pending',
     slip: !!src.slip,
     sha: clampStr(src.sha, 64), // F-06: แฮชสลิปไว้เทียบซ้ำ
+    ...(sanitizeQ(src.q) ? { q: sanitizeQ(src.q) } : {}),
   };
 }
 function sanitize(msg) {
@@ -245,20 +261,21 @@ wss.on('connection', (ws, req) => {
   const ch = url.searchParams.get('ch') || 'rzc_x';
   const tok = url.searchParams.get('tok') || '';
 
-  if (RELAY_TOKEN && tok !== RELAY_TOKEN) {
+  // ── Scope assignment (ห้ามเตะ donor ทิ้ง: donor ไม่มี token เป็นเรื่องปกติ) ──
+  //   LISTEN_TOKEN ตรง                 -> 'listener' (อ่านอย่างเดียว, ส่งอะไรไม่ได้)
+  //   ไม่ตั้ง RELAY_TOKEN              -> 'admin'    (พฤติกรรมเดิม 100%)
+  //   RELAY_TOKEN ตรง                  -> 'admin'
+  //   ไม่มี token / token อื่น         -> 'public'   (ส่งได้แค่ donation/sync)
+  // บัคเดิม: ตั้ง RELAY_TOKEN แล้ว connection ที่ไม่มี token (= หน้าโดเนทของผู้บริจาคทุกคน)
+  // ถูก close(4001) ทิ้ง -> โดเนทหยุดเข้าทั้งระบบ ทั้งที่คอมเมนต์ในไฟล์ระบุว่า "public ส่ง donation ได้"
+  // token ที่ "ผิดจริง ๆ" (ไม่ว่าง แต่ไม่ตรงทั้งสองค่า) ยังถูกปฏิเสธเหมือนเดิม
+  const isListener = !!LISTEN_TOKEN && tok === LISTEN_TOKEN;
+  const isAdmin = !RELAY_TOKEN || (!!tok && tok === RELAY_TOKEN);
+  if (tok && !isListener && !isAdmin && (RELAY_TOKEN || LISTEN_TOKEN)) {
     ws.close(4001, 'bad token');
     return;
   }
-
-  // ── Capability scope (ปิดช่องโหว่ F-01 ที่ราก): เดิม `ch` (channel key) เป็นความลับเดียว
-  // ที่ป้องกันทั้งระบบ แต่มันถูกฝังอยู่ในไฟล์ HTML สาธารณะ (View Source เห็นได้ทันที) — ใครมี ch
-  // ก็ส่ง alert/cfg/resolved ปลอมขึ้นจอสตรีมได้เหมือนเป็นแอดมิน
-  // ตอนนี้ยังไม่ "บังคับ" (ยังไม่ตั้งค่า RELAY_TOKEN = สถานะเดิมทุกอย่าง 100%, ทุก connection
-  // ได้ scope 'admin' เหมือนกันหมด ไม่มีอะไรถูกบล็อก) — ต่อเมื่อคุณตั้ง RELAY_TOKEN บน Render
-  // และให้เฉพาะแอดมินที่ล็อกอินแล้วส่ง ?tok= ที่ตรงกัน (ผ่าน CFG.token ที่เพิ่มไว้ใน index.html
-  // แล้ว) เท่านั้นที่จะได้ scope 'admin' จริง — คนอื่นที่มีแค่ ch จะได้ 'public' ส่งได้แค่
-  // donation/sync เท่านั้น ปลอม alert/cfg/resolved ไม่ได้อีกต่อไป
-  ws._scope = (!RELAY_TOKEN || tok === RELAY_TOKEN) ? 'admin' : 'public';
+  ws._scope = isListener ? 'listener' : (isAdmin ? 'admin' : 'public');
 
   ws.ch = ch;
   ws.isAlive = true;
@@ -278,7 +295,11 @@ wss.on('connection', (ws, req) => {
   // Replay backlog (pending donations) so a reconnecting admin catches up.
   pruneBacklog(ch);
   for (const msg of getBacklog(ch).values()) {
-    try { ws.send(JSON.stringify(msg)); } catch (e) {}
+    try {
+      const out = (ws._scope === 'listener' && msg.t === 'donation' && msg.d && msg.d.slip)
+        ? { ...msg, d: { ...msg.d, slip: null } } : msg;
+      ws.send(JSON.stringify(out));
+    } catch (e) {}
   }
 
   // Replay stored payment config so fresh donors get the PromptPay number.
@@ -305,6 +326,7 @@ wss.on('connection', (ws, req) => {
     try { parsed = JSON.parse(raw.toString()); } catch (e) { return; }
     if (!parsed || !parsed.t) return;
 
+    if (ws._scope === 'listener') return; // read-only: ทุกอย่างที่ listener ส่งมาถูกทิ้ง
     const msg = sanitize(parsed);
     if (!msg) return;
 
@@ -318,6 +340,13 @@ wss.on('connection', (ws, req) => {
     if (msg.t === 'donation' && msg.d && msg.d.rec && msg.d.rec.id) {
       getBacklog(ch).set(msg.d.rec.id, msg);
     } else if (msg.t === 'resolved' && msg.d && msg.d.id) {
+      // แนบ q + amount จากรายการที่เก็บไว้ (เชื่อถือได้กว่าที่ client ส่งมา) ให้ bridge ใช้สร้างคิว
+      // ทำเฉพาะ approved; ค่าจาก backlog เท่านั้น ไม่ใช้ค่าที่ admin client อ้างมาเอง
+      const held = getBacklog(ch).get(msg.d.id);
+      if (msg.d.status === 'approved' && held && held.d && held.d.rec) {
+        if (held.d.rec.q) msg.d.q = held.d.rec.q;
+        msg.d.amount = held.d.rec.amount;
+      }
       getBacklog(ch).delete(msg.d.id);
     } else if (msg.t === 'alert' && msg.d) {
       // เก็บ alert ล่าสุดไว้สั้น ๆ เผื่อ overlay หลุดต่อกลับพอดีจังหวะที่ยิง alert นี้
@@ -333,10 +362,15 @@ wss.on('connection', (ws, req) => {
     // Relay to every OTHER client in the same room. Stringify once (S-05: avoid
     // re-serializing the same message once per peer in a hot broadcast loop).
     const frame = JSON.stringify(msg);
+    // listener ไม่ต้องได้รูปสลิป (ใหญ่ + ข้อมูลอ่อนไหว) -> สร้างเฟรมแบบไม่มี slip แยกไว้ครั้งเดียว
+    let frameNoSlip = frame;
+    if (msg.t === 'donation' && msg.d && msg.d.slip) {
+      frameNoSlip = JSON.stringify({ ...msg, d: { ...msg.d, slip: null } });
+    }
     const peers = getRoom(ch);
     for (const client of peers) {
       if (client !== ws && client.readyState === client.OPEN) {
-        try { client.send(frame); } catch (e) {}
+        try { client.send(client._scope === 'listener' ? frameNoSlip : frame); } catch (e) {}
       }
     }
   });
@@ -379,6 +413,9 @@ function shutdown() {
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
 
+if (LISTEN_TOKEN && LISTEN_TOKEN === RELAY_TOKEN) {
+  console.error('!! LISTEN_TOKEN ต้องไม่เหมือน RELAY_TOKEN — ไม่งั้น listener จะมีสิทธิ์อ่านเท่านั้นไม่ได้จริง (ทั้งคู่ตรงกัน = admin)');
+}
 if (!RELAY_TOKEN) {
   console.warn('==================================================================');
   console.warn('  RELAY_TOKEN ยังไม่ได้ตั้งค่า — ทุก connection ได้สิทธิ์ admin เท่ากันหมด');
