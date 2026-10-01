@@ -33,6 +33,49 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '')
 // (เช่น OBS ที่โหลดไฟล์ .html ตรง ๆ จะส่ง Origin เป็น null/file:// ไม่ใช่โดเมนเว็บ)
 const ENFORCE_ORIGIN = process.env.ENFORCE_ORIGIN === '1';
 
+// ---- Admin login (server-side) ------------------------------------------------
+// ADMIN_PASSWORD_HASH = "scrypt$<saltHex>$<hashHex>"  (make with: node server.js --hash 'your password')
+// When set: the admin page POSTs the password to /admin/login and gets a short-lived SESSION
+// token back; that token (not the password) is what the websocket's ?tok= carries. The password
+// lives only on this server (as a hash), so it works from ANY device and nobody can "set up
+// their own admin" in a fresh browser. Unset = feature off (old RELAY_TOKEN/open behaviour).
+const crypto = require('crypto');
+const ADMIN_PASSWORD_HASH = process.env.ADMIN_PASSWORD_HASH || '';
+const SESSION_TTL_MS = 12 * 60 * 60 * 1000;      // 12h, sliding is NOT applied: re-login after expiry
+const sessions = new Map();                       // token -> expiresAt
+const loginFails = new Map();                     // ip -> {n, until}
+function scryptHash(pw, saltHex) {
+  const salt = Buffer.from(saltHex, 'hex');
+  return crypto.scryptSync(String(pw), salt, 32, { N: 16384, r: 8, p: 1 }).toString('hex');
+}
+function makeHash(pw) {
+  const salt = crypto.randomBytes(16).toString('hex');
+  return 'scrypt$' + salt + '$' + scryptHash(pw, salt);
+}
+function checkPassword(pw) {
+  const parts = ADMIN_PASSWORD_HASH.split('$');
+  if (parts.length !== 3 || parts[0] !== 'scrypt') return false;
+  let a, b;
+  try { a = Buffer.from(scryptHash(pw, parts[1]), 'hex'); b = Buffer.from(parts[2], 'hex'); } catch (e) { return false; }
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+function isSession(tok) {
+  if (!tok) return false;
+  const exp = sessions.get(tok);
+  if (!exp) return false;
+  if (exp < Date.now()) { sessions.delete(tok); return false; }
+  return true;
+}
+function clientIp(req) {
+  const xf = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+  return xf || (req.socket && req.socket.remoteAddress) || '?';
+}
+setInterval(() => { const now = Date.now(); for (const [t, e] of sessions) if (e < now) sessions.delete(t);
+  for (const [ip, f] of loginFails) if (f.until < now && f.n === 0) loginFails.delete(ip); }, 10 * 60 * 1000).unref();
+
+// CLI helper:  node server.js --hash 'my long password'   -> prints the value for ADMIN_PASSWORD_HASH
+if (process.argv[2] === '--hash') { console.log(makeHash(process.argv[3] || '')); process.exit(0); }
+
 // room (channel key) -> Set<ws>
 const rooms = new Map();
 // room -> Map<donationId, message>  (backlog of NOT-yet-approved donations)
@@ -98,6 +141,42 @@ const gcTimer = setInterval(() => {
   }
 }, 60 * 60 * 1000);
 
+function handleAdmin(req, res) {
+  const origin = req.headers.origin || '';
+  const okOrigin = !ALLOWED_ORIGINS.length || ALLOWED_ORIGINS.includes(origin);
+  const cors = { 'Access-Control-Allow-Origin': okOrigin && origin ? origin : (ALLOWED_ORIGINS[0] || '*'),
+    'Access-Control-Allow-Methods': 'POST, OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type', 'Vary': 'Origin' };
+  const send = (code, obj) => { res.writeHead(code, Object.assign({ 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }, cors)); res.end(JSON.stringify(obj)); };
+  if (req.method === 'OPTIONS') { res.writeHead(204, cors); return res.end(); }
+  if (req.method !== 'POST') return send(405, { ok: false, error: 'method' });
+  if (!ADMIN_PASSWORD_HASH) return send(503, { ok: false, error: 'admin login not configured' });
+  if (ALLOWED_ORIGINS.length && !okOrigin) return send(403, { ok: false, error: 'origin' });
+  const path = req.url.split('?')[0];
+  let body = '';
+  req.on('data', (c) => { body += c; if (body.length > 2048) req.destroy(); });
+  req.on('end', () => {
+    let j = {}; try { j = JSON.parse(body || '{}'); } catch (e) {}
+    if (path === '/admin/login') {
+      const ip = clientIp(req), now = Date.now();
+      const f = loginFails.get(ip) || { n: 0, until: 0 };
+      if (f.until > now) return send(429, { ok: false, error: 'locked', retryMs: f.until - now });
+      const pw = typeof j.password === 'string' ? j.password : '';
+      if (pw && pw.length <= 200 && checkPassword(pw)) {
+        loginFails.delete(ip);
+        const tok = 's_' + crypto.randomBytes(24).toString('hex');
+        sessions.set(tok, now + SESSION_TTL_MS);
+        return send(200, { ok: true, token: tok, expiresIn: SESSION_TTL_MS });
+      }
+      f.n++; if (f.n >= 5) { f.until = now + Math.min(30, 5 * Math.pow(2, f.n - 5)) * 60000; }   // 5 fails -> 5 min, doubling to 30 min
+      loginFails.set(ip, f);
+      return setTimeout(() => send(401, { ok: false, error: 'bad password', left: Math.max(0, 5 - f.n) }), 400);   // slow brute force
+    }
+    if (path === '/admin/check') return send(200, { ok: isSession(j.token) });
+    if (path === '/admin/logout') { if (j.token) sessions.delete(j.token); return send(200, { ok: true }); }
+    return send(404, { ok: false });
+  });
+}
+
 const server = http.createServer((req, res) => {
   if (req.url === '/health' || req.url === '/') {
     res.writeHead(200, { 'content-type': 'application/json' });
@@ -106,6 +185,7 @@ const server = http.createServer((req, res) => {
   }
   // TTS proxy (F-TTS-01): overlay ใน OBS ไม่มี speech engine เลย ต้องสังเคราะห์เสียงที่นี่
   // แล้วส่ง MP3 กลับไปให้ overlay เล่นผ่าน <audio> — ดู tts.js สำหรับรายละเอียด
+  if (req.url.startsWith('/admin/')) return handleAdmin(req, res);
   if (req.url.startsWith('/tts/health')) return handleTTSHealth(req, res);
   if (req.url.startsWith('/tts')) return handleTTS(req, res);
   res.writeHead(404);
@@ -270,8 +350,11 @@ wss.on('connection', (ws, req) => {
   // ถูก close(4001) ทิ้ง -> โดเนทหยุดเข้าทั้งระบบ ทั้งที่คอมเมนต์ในไฟล์ระบุว่า "public ส่ง donation ได้"
   // token ที่ "ผิดจริง ๆ" (ไม่ว่าง แต่ไม่ตรงทั้งสองค่า) ยังถูกปฏิเสธเหมือนเดิม
   const isListener = !!LISTEN_TOKEN && tok === LISTEN_TOKEN;
-  const isAdmin = !RELAY_TOKEN || (!!tok && tok === RELAY_TOKEN);
-  if (tok && !isListener && !isAdmin && (RELAY_TOKEN || LISTEN_TOKEN)) {
+  const sessOk = isSession(tok);
+  // Password login configured => the ONLY admin credentials are a live session (or RELAY_TOKEN if also set).
+  // Nothing configured at all => legacy open behaviour (unchanged).
+  const isAdmin = sessOk || (!!RELAY_TOKEN && !!tok && tok === RELAY_TOKEN) || (!RELAY_TOKEN && !ADMIN_PASSWORD_HASH);
+  if (tok && !isListener && !isAdmin && (RELAY_TOKEN || LISTEN_TOKEN || ADMIN_PASSWORD_HASH)) {
     ws.close(4001, 'bad token');
     return;
   }
