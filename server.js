@@ -279,6 +279,70 @@ function handleGithub(req, res) {
   return json(404, { ok: false }, cors);
 }
 
+
+// ── EasyDonate webhook (โดเนทจริงจาก easydonate.app -> alert ใน OBS) ───────────
+// EasyDonate Developer Zone > Webhook ชนิด "ปกติ" ส่ง POST JSON:
+//   { referenceNo, channelName, donatorName, donateMessage, amount, time }
+// ตั้งบน Render:  EASYDONATE_SECRET (สตริงสุ่มยาว ๆ ตั้งเอง)  EASYDONATE_CH (room key เช่น rzc_<key ของแอดมิน>)
+// URL ที่ใส่ใน EasyDonate:  https://<service>.onrender.com/easydonate/webhook?s=<EASYDONATE_SECRET>
+// เอกสาร EasyDonate ไม่มี signature header จึงยืนยันด้วย secret ใน URL (เทียบแบบ constant-time)
+// ไม่ตั้งตัวแปรครบ = endpoint ปิด (404) พฤติกรรมเดิม 100%
+// alert ที่ได้ติด ed:1 -> overlay ไม่อ่านเสียงซ้ำ (เสียงมาจาก widget ของ EasyDonate ใน OBS)
+const ED_SECRET = process.env.EASYDONATE_SECRET || '';
+const ED_CH = process.env.EASYDONATE_CH || '';
+const ED_ENABLED = ED_SECRET.length >= 16 && CH_RE.test(ED_CH);
+const edSeen = new Map();                         // referenceNo -> expiresAt (กัน EasyDonate retry ยิงซ้ำ)
+const ED_SEEN_TTL = 24 * 60 * 60 * 1000;
+setInterval(() => { const n = Date.now(); for (const [k, e] of edSeen) if (e < n) edSeen.delete(k); }, 10 * 60 * 1000).unref();
+
+function safeEq(a, b) {
+  const x = crypto.createHash('sha256').update(String(a)).digest();
+  const y = crypto.createHash('sha256').update(String(b)).digest();
+  return crypto.timingSafeEqual(x, y);
+}
+
+function handleEasyDonate(req, res) {
+  const send = (code, obj) => { res.writeHead(code, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }); res.end(JSON.stringify(obj)); };
+  if (!ED_ENABLED) return send(404, { ok: false });
+  if (req.method !== 'POST') return send(405, { ok: false });
+  let u; try { u = new URL(req.url, 'http://x'); } catch (e) { return send(400, { ok: false }); }
+  if (u.pathname !== '/easydonate/webhook') return send(404, { ok: false });
+  if (!safeEq(u.searchParams.get('s') || '', ED_SECRET)) {
+    console.warn('[easydonate] bad secret ip=' + clientIp(req));
+    return send(401, { ok: false });
+  }
+  let body = '';
+  req.on('data', (c) => { body += c; if (body.length > 8192) req.destroy(); });
+  req.on('end', () => {
+    let j; try { j = JSON.parse(body || '{}'); } catch (e) { return send(400, { ok: false, error: 'json' }); }
+    if (!j || typeof j !== 'object') return send(400, { ok: false });
+    const ref = clampStr(j.referenceNo, 64);
+    const amount = Number(j.amount);
+    if (!(amount > 0) || !isFinite(amount) || amount > 1000000) return send(400, { ok: false, error: 'amount' });
+    if (ref) {
+      const exp = edSeen.get(ref);
+      if (exp && exp > Date.now()) return send(200, { ok: true, duplicate: true });   // retry -> ตอบสำเร็จแต่ไม่ยิงซ้ำ
+      edSeen.set(ref, Date.now() + ED_SEEN_TTL);
+    }
+    const msg = { t: 'alert', _at: Date.now(), d: {
+      name: clampStr(j.donatorName, 40) || 'ANONYMOUS',
+      amount: Math.floor(amount),
+      message: clampStr(j.donateMessage, 200),
+      ed: 1,
+    } };
+    // ลง backlog สั้น ๆ เหมือน alert ปกติ (overlay หลุดต่อพอดีก็ยังได้การ์ด)
+    pruneAlerts(ED_CH);
+    if (!alertBacklog.has(ED_CH)) alertBacklog.set(ED_CH, []);
+    const arr = alertBacklog.get(ED_CH); arr.push(msg); if (arr.length > ALERT_MAX) arr.shift();
+    lastSeen.set(ED_CH, Date.now());
+    const frame = JSON.stringify(msg);
+    let n = 0;
+    for (const c of getRoom(ED_CH)) { if (c.readyState === 1) { try { c.send(frame); n++; } catch (e) {} } }
+    console.log('[easydonate] ok ref=' + ref + ' amount=' + msg.d.amount + ' delivered=' + n);
+    return send(200, { ok: true, delivered: n });
+  });
+}
+
 const server = http.createServer((req, res) => {
   if (req.url === '/health' || req.url === '/') {
     res.writeHead(200, { 'content-type': 'application/json' });
@@ -287,6 +351,7 @@ const server = http.createServer((req, res) => {
   }
   // TTS proxy (F-TTS-01): overlay ใน OBS ไม่มี speech engine เลย ต้องสังเคราะห์เสียงที่นี่
   // แล้วส่ง MP3 กลับไปให้ overlay เล่นผ่าน <audio> — ดู tts.js สำหรับรายละเอียด
+  if (req.url.startsWith('/easydonate/')) return handleEasyDonate(req, res);
   if (req.url.startsWith('/admin/github/')) return handleGithub(req, res);
   if (req.url.startsWith('/admin/')) return handleAdmin(req, res);
   if (req.url.startsWith('/tts/health')) return handleTTSHealth(req, res);
@@ -432,6 +497,8 @@ function sanitize(msg) {
         pp: clampStr(d.pp, 20), payee: clampStr(d.payee, 25),
         goal: Math.max(0, Number(d.goal) || 0), min: Math.max(0, Number(d.min) || 0),
         reqSlip: !!d.reqSlip,
+        // ลิงก์หน้าโดเนท EasyDonate: รับเฉพาะ https://easydonate.app/<ชื่อ> ไม่งั้นเป็นค่าว่าง (กัน redirect ไปเว็บอื่น)
+        ed: /^https:\/\/(www\.)?easydonate\.app\/[A-Za-z0-9_.-]{1,64}\/?$/.test(String(d.ed || '')) ? String(d.ed) : '',
       },
     };
   }
