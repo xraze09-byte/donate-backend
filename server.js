@@ -177,6 +177,108 @@ function handleAdmin(req, res) {
   });
 }
 
+
+// ── GitHub login (OAuth) สำหรับแอดมิน ─────────────────────────────────────────
+// ตั้งบน Render:  GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET, GITHUB_ADMIN_LOGIN (เช่น xraze09-byte)
+//   OAuth App callback URL = https://<service>.onrender.com/admin/github/callback
+//   ADMIN_RETURN_URL (ไม่บังคับ) = หน้าแอดมินที่จะเด้งกลับ เช่น https://rz-clan-v4.vercel.app/#admin
+//     (ถ้าไม่ตั้ง ใช้ ALLOWED_ORIGINS[0] + '/#admin')
+// ลำดับ: /admin/github/start -> github.com -> /admin/github/callback (เช็ก login ตรง GITHUB_ADMIN_LOGIN เท่านั้น)
+//   -> เด้งกลับหน้าแอดมินพร้อม one-time code (#admin?gh=CODE, ใช้ได้ครั้งเดียว อายุ 60 วิ)
+//   -> หน้าแอดมิน POST /admin/github/exchange {code} แลกเป็น session token ตัวเดียวกับล็อกอินรหัสผ่าน
+// session token ไม่เคยอยู่ใน URL · ไม่ตั้งตัวแปรครบ = ปิดฟีเจอร์ (พฤติกรรมเดิม 100%)
+const GH_ID = process.env.GITHUB_CLIENT_ID || '';
+const GH_SECRET = process.env.GITHUB_CLIENT_SECRET || '';
+const GH_ADMIN = (process.env.GITHUB_ADMIN_LOGIN || '').trim().toLowerCase();
+const GH_ENABLED = !!(GH_ID && GH_SECRET && GH_ADMIN);
+const GH_RETURN = process.env.ADMIN_RETURN_URL || ((ALLOWED_ORIGINS[0] || '') ? ALLOWED_ORIGINS[0].replace(/\/$/, '') + '/#admin' : '');
+const ghStates = new Map();                       // state -> expiresAt (กัน CSRF, ใช้ครั้งเดียว)
+const ghCodes = new Map();                        // one-time code -> expiresAt
+const GH_TTL_MS = 60 * 1000;
+setInterval(() => { const n = Date.now(); for (const m of [ghStates, ghCodes]) for (const [k, e] of m) if (e < n) m.delete(k); }, 60 * 1000).unref();
+
+function publicBase(req) {
+  const proto = String(req.headers['x-forwarded-proto'] || 'https').split(',')[0].trim();
+  return proto + '://' + (req.headers['x-forwarded-host'] || req.headers.host);
+}
+function ghFetchJson(url, opts) {
+  return fetch(url, Object.assign({ signal: AbortSignal.timeout(10000) }, opts)).then((r) => r.json());
+}
+
+function handleGithub(req, res) {
+  const path = req.url.split('?')[0];
+  const json = (code, obj, extra) => { res.writeHead(code, Object.assign({ 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }, extra || {})); res.end(JSON.stringify(obj)); };
+  const back = (qs) => {            // เด้งกลับหน้าแอดมิน
+    if (!GH_RETURN) return json(200, { ok: false, error: 'ADMIN_RETURN_URL/ALLOWED_ORIGINS not set' });
+    const base = GH_RETURN.split('#')[0];
+    res.writeHead(302, { Location: base + '#admin?' + qs, 'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer' }); res.end();
+  };
+  const origin = req.headers.origin || '';
+  const okOrigin = !ALLOWED_ORIGINS.length || ALLOWED_ORIGINS.includes(origin);
+  const cors = { 'Access-Control-Allow-Origin': okOrigin && origin ? origin : (ALLOWED_ORIGINS[0] || '*'),
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type', 'Vary': 'Origin' };
+
+  // หน้าแอดมินถามว่าเปิดปุ่ม GitHub ไหม
+  if (path === '/admin/github/enabled') return json(200, { ok: GH_ENABLED }, cors);
+  if (!GH_ENABLED) return json(503, { ok: false, error: 'github login not configured' }, cors);
+
+  if (path === '/admin/github/start') {
+    const ip = clientIp(req), now = Date.now();
+    const f = loginFails.get(ip) || { n: 0, until: 0 };
+    if (f.until > now) return back('gherr=locked');
+    const state = crypto.randomBytes(24).toString('hex');
+    ghStates.set(state, now + 10 * 60 * 1000);
+    const q = new URLSearchParams({ client_id: GH_ID, redirect_uri: publicBase(req) + '/admin/github/callback', scope: 'read:user', state, allow_signup: 'false' });
+    res.writeHead(302, { Location: 'https://github.com/login/oauth/authorize?' + q, 'Cache-Control': 'no-store' }); return res.end();
+  }
+
+  if (path === '/admin/github/callback') {
+    let u; try { u = new URL(req.url, 'http://x'); } catch (e) { return back('gherr=bad'); }
+    const state = u.searchParams.get('state') || '', code = u.searchParams.get('code') || '';
+    const exp = ghStates.get(state); ghStates.delete(state);              // ใช้ได้ครั้งเดียว
+    if (!exp || exp < Date.now() || !code) return back('gherr=state');
+    const ip = clientIp(req);
+    (async () => {
+      try {
+        const tk = await ghFetchJson('https://github.com/login/oauth/access_token', {
+          method: 'POST', headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+          body: JSON.stringify({ client_id: GH_ID, client_secret: GH_SECRET, code, redirect_uri: publicBase(req) + '/admin/github/callback' }) });
+        if (!tk.access_token) return back('gherr=token');
+        const me = await ghFetchJson('https://api.github.com/user', { headers: { Authorization: 'Bearer ' + tk.access_token, 'User-Agent': 'rz-clan-relay', Accept: 'application/vnd.github+json' } });
+        const login = String((me && me.login) || '').toLowerCase();
+        if (!login || login !== GH_ADMIN) {
+          console.warn('[github-login] DENIED login=' + login + ' ip=' + ip);
+          return back('gherr=denied');
+        }
+        const oc = 'gh_' + crypto.randomBytes(24).toString('hex');
+        ghCodes.set(oc, Date.now() + GH_TTL_MS);
+        console.log('[github-login] OK login=' + login);
+        return back('gh=' + oc);
+      } catch (e) { console.error('[github-login] error:', e && e.message); return back('gherr=server'); }
+    })();
+    return;
+  }
+
+  if (path === '/admin/github/exchange') {
+    if (req.method === 'OPTIONS') { res.writeHead(204, cors); return res.end(); }
+    if (req.method !== 'POST') return json(405, { ok: false }, cors);
+    if (ALLOWED_ORIGINS.length && !okOrigin) return json(403, { ok: false, error: 'origin' }, cors);
+    let body = '';
+    req.on('data', (c) => { body += c; if (body.length > 1024) req.destroy(); });
+    req.on('end', () => {
+      let j = {}; try { j = JSON.parse(body || '{}'); } catch (e) {}
+      const code = typeof j.code === 'string' ? j.code : '';
+      const exp = ghCodes.get(code); ghCodes.delete(code);                 // one-time
+      if (!exp || exp < Date.now()) return json(401, { ok: false, error: 'bad code' }, cors);
+      const tok = 's_' + crypto.randomBytes(24).toString('hex');
+      sessions.set(tok, Date.now() + SESSION_TTL_MS);
+      return json(200, { ok: true, token: tok, expiresIn: SESSION_TTL_MS }, cors);
+    });
+    return;
+  }
+  return json(404, { ok: false }, cors);
+}
+
 const server = http.createServer((req, res) => {
   if (req.url === '/health' || req.url === '/') {
     res.writeHead(200, { 'content-type': 'application/json' });
@@ -185,6 +287,7 @@ const server = http.createServer((req, res) => {
   }
   // TTS proxy (F-TTS-01): overlay ใน OBS ไม่มี speech engine เลย ต้องสังเคราะห์เสียงที่นี่
   // แล้วส่ง MP3 กลับไปให้ overlay เล่นผ่าน <audio> — ดู tts.js สำหรับรายละเอียด
+  if (req.url.startsWith('/admin/github/')) return handleGithub(req, res);
   if (req.url.startsWith('/admin/')) return handleAdmin(req, res);
   if (req.url.startsWith('/tts/health')) return handleTTSHealth(req, res);
   if (req.url.startsWith('/tts')) return handleTTS(req, res);
