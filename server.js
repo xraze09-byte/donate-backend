@@ -52,6 +52,21 @@ function makeHash(pw) {
   const salt = crypto.randomBytes(16).toString('hex');
   return 'scrypt$' + salt + '$' + scryptHash(pw, salt);
 }
+// Async variant used on the request path: scryptSync froze the whole event loop ~1s per attempt
+// (40 parallel logins stalled websocket pings and /health), so alerts could hang mid-stream.
+let loginBusy = 0;
+function scryptAsync(pw, saltHex) {
+  return new Promise((resolve, reject) => crypto.scrypt(String(pw), Buffer.from(saltHex, 'hex'), 32,
+    { N: 16384, r: 8, p: 1 }, (e, k) => (e ? reject(e) : resolve(k))));
+}
+async function checkPasswordAsync(pw) {
+  const parts = ADMIN_PASSWORD_HASH.split('$');
+  if (parts.length !== 3 || parts[0] !== 'scrypt') return false;
+  try {
+    const a = await scryptAsync(pw, parts[1]); const b = Buffer.from(parts[2], 'hex');
+    return a.length === b.length && crypto.timingSafeEqual(a, b);
+  } catch (e) { return false; }
+}
 function checkPassword(pw) {
   const parts = ADMIN_PASSWORD_HASH.split('$');
   if (parts.length !== 3 || parts[0] !== 'scrypt') return false;
@@ -66,9 +81,11 @@ function isSession(tok) {
   if (exp < Date.now()) { sessions.delete(tok); return false; }
   return true;
 }
+// The LEFTMOST X-Forwarded-For entry is whatever the client wrote, so a spoofed header gave an
+// attacker a fresh lockout bucket per guess. The RIGHTMOST entry is the one our own proxy appended.
 function clientIp(req) {
-  const xf = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
-  return xf || (req.socket && req.socket.remoteAddress) || '?';
+  const parts = String(req.headers['x-forwarded-for'] || '').split(',').map((x) => x.trim()).filter(Boolean);
+  return parts[parts.length - 1] || (req.socket && req.socket.remoteAddress) || '?';
 }
 setInterval(() => { const now = Date.now(); for (const [t, e] of sessions) if (e < now) sessions.delete(t);
   for (const [ip, f] of loginFails) if (f.until < now && f.n === 0) loginFails.delete(ip); }, 10 * 60 * 1000).unref();
@@ -154,14 +171,17 @@ function handleAdmin(req, res) {
   const path = req.url.split('?')[0];
   let body = '';
   req.on('data', (c) => { body += c; if (body.length > 2048) req.destroy(); });
-  req.on('end', () => {
+  req.on('end', async () => {
     let j = {}; try { j = JSON.parse(body || '{}'); } catch (e) {}
     if (path === '/admin/login') {
       const ip = clientIp(req), now = Date.now();
       const f = loginFails.get(ip) || { n: 0, until: 0 };
       if (f.until > now) return send(429, { ok: false, error: 'locked', retryMs: f.until - now });
       const pw = typeof j.password === 'string' ? j.password : '';
-      if (pw && pw.length <= 200 && checkPassword(pw)) {
+      if (loginBusy >= 2) return send(503, { ok: false, error: 'busy', retryMs: 1000 });   // 503 (not 429) so the UI says 'try again', not 'locked'   // cap concurrent scrypt work
+      let good = false;
+      if (pw && pw.length <= 200) { loginBusy++; try { good = await checkPasswordAsync(pw); } finally { loginBusy--; } }
+      if (good) {
         loginFails.delete(ip);
         const tok = 's_' + crypto.randomBytes(24).toString('hex');
         sessions.set(tok, now + SESSION_TTL_MS);
@@ -190,6 +210,7 @@ function handleAdmin(req, res) {
 const GH_ID = process.env.GITHUB_CLIENT_ID || '';
 const GH_SECRET = process.env.GITHUB_CLIENT_SECRET || '';
 const GH_ADMIN = (process.env.GITHUB_ADMIN_LOGIN || '').trim().toLowerCase();
+const GH_ADMIN_ID = String(process.env.GITHUB_ADMIN_ID || '').trim();   // optional but recommended: numeric id, immune to renames
 const GH_ENABLED = !!(GH_ID && GH_SECRET && GH_ADMIN);
 const GH_RETURN = process.env.ADMIN_RETURN_URL || ((ALLOWED_ORIGINS[0] || '') ? ALLOWED_ORIGINS[0].replace(/\/$/, '') + '/#admin' : '');
 const ghStates = new Map();                       // state -> expiresAt (กัน CSRF, ใช้ครั้งเดียว)
@@ -197,7 +218,9 @@ const ghCodes = new Map();                        // one-time code -> expiresAt
 const GH_TTL_MS = 60 * 1000;
 setInterval(() => { const n = Date.now(); for (const m of [ghStates, ghCodes]) for (const [k, e] of m) if (e < n) m.delete(k); }, 60 * 1000).unref();
 
+const PUBLIC_BASE = (process.env.PUBLIC_BASE || '').trim().replace(/\/$/, '');   // e.g. https://donate-backend-60hc.onrender.com
 function publicBase(req) {
+  if (PUBLIC_BASE) return PUBLIC_BASE;
   const proto = String(req.headers['x-forwarded-proto'] || 'https').split(',')[0].trim();
   return proto + '://' + (req.headers['x-forwarded-host'] || req.headers.host);
 }
@@ -246,13 +269,14 @@ function handleGithub(req, res) {
         if (!tk.access_token) return back('gherr=token');
         const me = await ghFetchJson('https://api.github.com/user', { headers: { Authorization: 'Bearer ' + tk.access_token, 'User-Agent': 'rz-clan-relay', Accept: 'application/vnd.github+json' } });
         const login = String((me && me.login) || '').toLowerCase();
-        if (!login || login !== GH_ADMIN) {
-          console.warn('[github-login] DENIED login=' + login + ' ip=' + ip);
+        const uid = String((me && me.id) || '');
+        if (!login || login !== GH_ADMIN || (GH_ADMIN_ID && uid !== GH_ADMIN_ID)) {
+          console.warn('[github-login] DENIED login=' + login + ' id=' + uid + ' ip=' + ip);
           return back('gherr=denied');
         }
         const oc = 'gh_' + crypto.randomBytes(24).toString('hex');
         ghCodes.set(oc, Date.now() + GH_TTL_MS);
-        console.log('[github-login] OK login=' + login);
+        console.log('[github-login] OK login=' + login + ' id=' + uid + (GH_ADMIN_ID ? '' : ' (tip: set GITHUB_ADMIN_ID=' + uid + ' to pin the account by id)'));
         return back('gh=' + oc);
       } catch (e) { console.error('[github-login] error:', e && e.message); return back('gherr=server'); }
     })();
@@ -301,6 +325,10 @@ function safeEq(a, b) {
   return crypto.timingSafeEqual(x, y);
 }
 
+// light flood guard even with a valid secret: max 20 alerts / 10s
+let edWin = [];
+function edRate() { const n = Date.now(); edWin = edWin.filter((t) => n - t < 10000); if (edWin.length >= 20) return true; edWin.push(n); return false; }
+
 function handleEasyDonate(req, res) {
   const send = (code, obj) => { res.writeHead(code, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }); res.end(JSON.stringify(obj)); };
   if (!ED_ENABLED) return send(404, { ok: false });
@@ -316,9 +344,15 @@ function handleEasyDonate(req, res) {
   req.on('end', () => {
     let j; try { j = JSON.parse(body || '{}'); } catch (e) { return send(400, { ok: false, error: 'json' }); }
     if (!j || typeof j !== 'object') return send(400, { ok: false });
-    const ref = clampStr(j.referenceNo, 64);
-    const amount = Number(j.amount);
-    if (!(amount > 0) || !isFinite(amount) || amount > 1000000) return send(400, { ok: false, error: 'amount' });
+    // referenceNo must be a plain string/number; objects used to be coerced to "[object Object]"
+    const rawRef = (typeof j.referenceNo === 'string' || typeof j.referenceNo === 'number') ? j.referenceNo : '';
+    // No referenceNo => fall back to a content fingerprint so an EasyDonate retry cannot double the alert
+    const ref = clampStr(rawRef, 64) || ('fp:' + crypto.createHash('sha1').update([j.donatorName, j.amount, j.donateMessage, String(j.time || '')].join('|')).digest('hex').slice(0, 24));
+    // Strict amount: a number, or a plain decimal string. Rejects "1e5", "0x10", "  5 ", NaN, and sub-1-baht (floored to a 0 baht alert).
+    const amtOk = typeof j.amount === 'number' || (typeof j.amount === 'string' && /^\d{1,7}(\.\d{1,2})?$/.test(j.amount));
+    const amount = amtOk ? Number(j.amount) : NaN;
+    if (!(amount >= 1) || !isFinite(amount) || amount > 1000000) return send(400, { ok: false, error: 'amount' });
+    if (edRate()) return send(429, { ok: false, error: 'slow' });
     if (ref) {
       const exp = edSeen.get(ref);
       if (exp && exp > Date.now()) return send(200, { ok: true, duplicate: true });   // retry -> ตอบสำเร็จแต่ไม่ยิงซ้ำ
