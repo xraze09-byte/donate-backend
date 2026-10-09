@@ -300,8 +300,9 @@ function prep(raw) {
 async function handleTTS(req, res) {
   try {
     const u  = new URL(req.url, 'http://x');
-    const ip = (req.headers['x-forwarded-for'] || '').split(',')[0].trim()
-               || req.socket.remoteAddress || 'ip';
+    // rightmost XFF entry = appended by our proxy; the leftmost is client-controlled (limiter bypass)
+    const xff = String(req.headers['x-forwarded-for'] || '').split(',').map((x) => x.trim()).filter(Boolean);
+    const ip = xff[xff.length - 1] || req.socket.remoteAddress || 'ip';
 
     if (req.method === 'OPTIONS') {
       res.writeHead(204, {
@@ -311,7 +312,13 @@ async function handleTTS(req, res) {
       });
       return res.end();
     }
-    if (u.pathname === '/tts/diag') return handleDiag(res);
+    if (u.pathname === '/tts/diag') {
+      // was public + unmetered (3 Edge handshakes + 1 Google call per hit). Now needs TTS_DIAG_KEY and counts against the limiter.
+      const key = process.env.TTS_DIAG_KEY || '';
+      if (!key || u.searchParams.get('k') !== key) { res.writeHead(404); return res.end(); }
+      if (!rateOk(ip)) { res.writeHead(429, { 'Retry-After': '5' }); return res.end('slow'); }
+      return handleDiag(res);
+    }
     if (req.method !== 'GET')  { res.writeHead(405); return res.end(); }
     if (!rateOk(ip)) { res.writeHead(429, { 'Retry-After': '5' }); return res.end('slow'); }
 
