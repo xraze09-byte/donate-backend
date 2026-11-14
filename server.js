@@ -131,6 +131,30 @@ function getBacklog(ch) {
   return backlog.get(ch);
 }
 
+// ── Server-side anti-abuse for PUBLIC donors (donation messages) ─────────────────────────────
+// The per-connection token bucket (below) is reset by simply reconnecting, and the browser-side
+// cooldown can be bypassed by anyone who talks to the socket directly. These limits are keyed on
+// the proxy-appended client IP (rightmost X-Forwarded-For) so they survive reconnects.
+// Defaults are generous for real donors; set any value to 0 to disable that limit.
+//   DONATE_PER_IP_MAX / DONATE_PER_IP_WINDOW_S   max donation msgs per IP per window   (default 6 / 600s)
+//   DONATE_MIN_GAP_MS                            min gap between two donations per IP   (default 3000ms)
+//   DONATE_PENDING_CAP                           max un-approved donations per room     (default 200)
+//   PUBLIC_CONN_PER_IP                           max simultaneous public sockets per IP (default 8)
+const envInt = (k, d) => { const v = parseInt(process.env[k], 10); return Number.isFinite(v) && v >= 0 ? v : d; };
+const DON_MAX = envInt('DONATE_PER_IP_MAX', 6), DON_WIN = envInt('DONATE_PER_IP_WINDOW_S', 600) * 1000;
+const DON_GAP = envInt('DONATE_MIN_GAP_MS', 3000), PENDING_CAP = envInt('DONATE_PENDING_CAP', 200);
+const PUB_CONN_MAX = envInt('PUBLIC_CONN_PER_IP', 8);
+const donHits = new Map();   // ip -> [timestamps]
+const pubConns = new Map();  // ip -> open public socket count
+function donationAllowed(ip, now) {
+  let a = donHits.get(ip) || [];
+  if (DON_WIN) a = a.filter((t) => now - t < DON_WIN);
+  if (DON_GAP && a.length && now - a[a.length - 1] < DON_GAP) { donHits.set(ip, a); return false; }
+  if (DON_MAX && DON_WIN && a.length >= DON_MAX) { donHits.set(ip, a); return false; }
+  a.push(now); donHits.set(ip, a); return true;
+}
+setInterval(() => { const now = Date.now(); for (const [ip, a] of donHits) { if (!a.length || now - a[a.length - 1] > Math.max(DON_WIN, 60000)) donHits.delete(ip); } }, 5 * 60 * 1000).unref();
+
 function pruneBacklog(ch) {
   const b = getBacklog(ch);
   const now = Date.now();
@@ -563,6 +587,14 @@ wss.on('connection', (ws, req) => {
     return;
   }
   ws._scope = isListener ? 'listener' : (isAdmin ? 'admin' : 'public');
+  ws._ip = clientIp(req);
+  ws._anon = !tok;   // donor page never carries a token; admins/listeners do (legacy no-token deployments: limits still apply, they are generous)
+  if (ws._anon && ws._scope !== 'listener' && PUB_CONN_MAX) {
+    const n = (pubConns.get(ws._ip) || 0) + 1;
+    if (n > PUB_CONN_MAX) { ws.close(4009, 'too many connections'); return; }
+    pubConns.set(ws._ip, n);
+    ws.on('close', () => { const m = (pubConns.get(ws._ip) || 1) - 1; if (m <= 0) pubConns.delete(ws._ip); else pubConns.set(ws._ip, m); });
+  }
 
   ws.ch = ch;
   ws.isAlive = true;
@@ -620,6 +652,12 @@ wss.on('connection', (ws, req) => {
     // Capability scope enforcement — no-op today while RELAY_TOKEN is unset (see above).
     if (ADMIN_TYPES.has(msg.t) && ws._scope !== 'admin') return; // drop เงียบ ไม่ relay ไม่ backlog
     if (!ADMIN_TYPES.has(msg.t) && !PUBLIC_TYPES.has(msg.t)) return;
+
+    // Anonymous donors only (no token presented): token-bearing admins are never throttled by the donor limits.
+    if (msg.t === 'donation' && ws._anon) {
+      if (PENDING_CAP && getBacklog(ch).size >= PENDING_CAP && !getBacklog(ch).has(msg.d && msg.d.rec && msg.d.rec.id)) return;
+      if (!donationAllowed(ws._ip || '?', Date.now())) return;
+    }
 
     lastSeen.set(ch, msg._at);
 

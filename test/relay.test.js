@@ -4,7 +4,7 @@ const {spawn}=require('child_process');const WebSocket=require('ws');const path=
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 let pass=0,fail=0;const ok=(c,l)=>{c?pass++:fail++;console.log((c?'PASS ':'FAIL ')+l)};
 const CH='rzc_testchannel01',RT='relay_admin_tok',LT='listen_only_tok';
-function boot(port,env){const p=spawn('node',['server.js'],{cwd:path.join(__dirname,'..'),env:{...process.env,PORT:String(port),...env}});
+function boot(port,env){const p=spawn('node',['server.js'],{cwd:path.join(__dirname,'..'),env:{...process.env,DONATE_MIN_GAP_MS:'0',DONATE_PER_IP_MAX:'0',PUBLIC_CONN_PER_IP:'0',DONATE_PENDING_CAP:'0',PORT:String(port),...env}});
  kids.push(p);let log='';p.stdout.on('data',d=>log+=d);p.stderr.on('data',d=>log+=d);p.log=()=>log;return p}
 function conn(port,q){return new Promise((res)=>{const w=new WebSocket(`ws://127.0.0.1:${port}/ws?${q}`);w.msgs=[];w.code=null;w.opened=false;let done=false;
  const fin=()=>{if(!done){done=true;res(w)}};

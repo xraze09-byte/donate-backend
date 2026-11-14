@@ -105,3 +105,20 @@ npm start
 ## Files
 - `server.js` — the relay server (see above)
 - `package.json` — one dependency: `ws`
+
+
+## Anti-abuse limits for donors (server-side)
+
+The browser cooldown can be bypassed by talking to the socket directly, so the relay enforces its own limits
+on anonymous donor connections (no token). They are keyed on the proxy-appended client IP (rightmost
+`X-Forwarded-For`), so reconnecting does not reset them. Admin and listener tokens are never throttled.
+Set any value to `0` to disable that limit.
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `DONATE_PER_IP_MAX` / `DONATE_PER_IP_WINDOW_S` | 6 / 600 | max donations per IP per window |
+| `DONATE_MIN_GAP_MS` | 3000 | min gap between two donations from one IP |
+| `DONATE_PENDING_CAP` | 200 | max un-approved donations held per room |
+| `PUBLIC_CONN_PER_IP` | 8 | max simultaneous donor sockets per IP (extra closed with code 4009) |
+
+Tests: `npm test` (relay + rate-limit suites, real `server.js`).

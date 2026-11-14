@@ -4,7 +4,8 @@
   "description": "Realtime WebSocket relay for RZ CLAN donation terminal — syncs donor submissions into the admin queue across devices.",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node test/relay.test.js && node test/ratelimit.test.js"
   },
   "engines": {
     "node": ">=18"
