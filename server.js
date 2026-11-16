@@ -517,6 +517,21 @@ function sanitizeRec(src) {
     ...(sanitizeQ(src.q) ? { q: sanitizeQ(src.q) } : {}),
   };
 }
+// Signed admin messages (alert/cfg/resolved): pass the signature fields through UNCHANGED so the overlay/donor page can verify them.
+// The relay never verifies or trusts them (it has no key); it only keeps well-formed values and drops anything else, so a client that
+// does not sign gets exactly the old output. sig/nonce: base64url-ish, bounded. ts: finite epoch ms.
+const SIG_RE = /^[A-Za-z0-9_\-+/=.]{16,512}$/, NONCE_RE = /^[A-Za-z0-9_\-+/=.]{8,128}$/;
+function sigFields(src) {
+  const out = {};
+  if (!src || typeof src !== 'object') return out;
+  if (typeof src.sig === 'string' && SIG_RE.test(src.sig)) out.sig = src.sig;
+  if (typeof src.nonce === 'string' && NONCE_RE.test(src.nonce)) out.nonce = src.nonce;
+  const ts = Number(src.ts);
+  if (out.sig && Number.isFinite(ts) && ts > 0 && ts < 1e14) out.ts = ts;
+  // a signature without its nonce/ts can never verify: drop the lot rather than forward a half-signed message
+  if (!(out.sig && out.nonce && out.ts)) return {};
+  return out;
+}
 function sanitize(msg) {
   const t = msg.t;
   if (t === 'donation') {
@@ -535,6 +550,7 @@ function sanitize(msg) {
         name: clampStr(src.name, 40) || 'ANONYMOUS',
         amount: Math.min(Math.max(Number(src.amount) || 0, 0), 1000000),
         message: clampStr(src.message, 200),
+        ...sigFields(src),
       },
     };
   }
@@ -544,7 +560,7 @@ function sanitize(msg) {
     if (!id) return null;
     return {
       t, _at: Date.now(),
-      d: { id, status: ['approved', 'rejected'].includes(src.status) ? src.status : 'approved' },
+      d: { id, status: ['approved', 'rejected'].includes(src.status) ? src.status : 'approved', ...sigFields(src) },
     };
   }
   if (t === 'cfg') {
@@ -557,6 +573,7 @@ function sanitize(msg) {
         reqSlip: !!d.reqSlip,
         // ลิงก์หน้าโดเนท EasyDonate: รับเฉพาะ https://easydonate.app/<ชื่อ> ไม่งั้นเป็นค่าว่าง (กัน redirect ไปเว็บอื่น)
         ed: /^https:\/\/(www\.)?easydonate\.app\/[A-Za-z0-9_.-]{1,64}\/?$/.test(String(d.ed || '')) ? String(d.ed) : '',
+        ...sigFields(d),
       },
     };
   }
