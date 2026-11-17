@@ -40,6 +40,7 @@ const ENFORCE_ORIGIN = process.env.ENFORCE_ORIGIN === '1';
 // lives only on this server (as a hash), so it works from ANY device and nobody can "set up
 // their own admin" in a fresh browser. Unset = feature off (old RELAY_TOKEN/open behaviour).
 const crypto = require('crypto');
+const SEC = require('./security');
 const ADMIN_PASSWORD_HASH = process.env.ADMIN_PASSWORD_HASH || '';
 const SESSION_TTL_MS = 12 * 60 * 60 * 1000;      // 12h, sliding is NOT applied: re-login after expiry
 const sessions = new Map();                       // token -> expiresAt
@@ -401,12 +402,34 @@ function handleEasyDonate(req, res) {
   });
 }
 
+// GET /csrf -> { token }. Short-lived HMAC token bound to the caller's IP; the donate page sends it back
+// inside its donation message. Always available (harmless when CSRF_MODE is off), limited per IP.
+const csrfHits = new Map();
+setInterval(() => { const now = Date.now(); for (const [ip, a] of csrfHits) { if (!a.length || now - a[a.length - 1] > 120000) csrfHits.delete(ip); } }, 60000).unref();
+function handleCsrf(req, res) {
+  const origin = req.headers.origin || '';
+  const okOrigin = !ALLOWED_ORIGINS.length || ALLOWED_ORIGINS.includes(origin);
+  const cors = { 'Access-Control-Allow-Origin': okOrigin && origin ? origin : (ALLOWED_ORIGINS[0] || '*'),
+    'Access-Control-Allow-Methods': 'GET, OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type', 'Vary': 'Origin' };
+  const send = (code, obj) => { res.writeHead(code, Object.assign({ 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }, cors)); res.end(obj == null ? '' : JSON.stringify(obj)); };
+  if (req.method === 'OPTIONS') { res.writeHead(204, cors); return res.end(); }
+  if (req.method !== 'GET') return send(405, { ok: false, error: 'method' });
+  if (ENFORCE_ORIGIN && ALLOWED_ORIGINS.length && !okOrigin) return send(403, { ok: false, error: 'origin' });
+  const ip = clientIp(req), now = Date.now();
+  const a = (csrfHits.get(ip) || []).filter((t) => now - t < 60000);
+  if (a.length >= 30) { csrfHits.set(ip, a); return send(429, { ok: false, error: 'rate' }); }
+  a.push(now); csrfHits.set(ip, a);
+  return send(200, { ok: true, token: SEC.issueCsrf(ip) });
+}
+
 const server = http.createServer((req, res) => {
   if (req.url === '/health' || req.url === '/') {
     res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ ok: true, rooms: rooms.size }));
+    res.end(JSON.stringify({ ok: true, rooms: rooms.size,
+      sec: { signed: SEC.CFG.signed, csrf: SEC.CFG.csrf, pow: SEC.CFG.powBits ? SEC.CFG.powBits + ':' + SEC.CFG.powMode : 'off', strict: SEC.CFG.strict, hits: SEC.stats } }));
     return;
   }
+  if (req.url.split('?')[0] === '/csrf') return handleCsrf(req, res);
   // TTS proxy (F-TTS-01): overlay ใน OBS ไม่มี speech engine เลย ต้องสังเคราะห์เสียงที่นี่
   // แล้วส่ง MP3 กลับไปให้ overlay เล่นผ่าน <audio> — ดู tts.js สำหรับรายละเอียด
   if (req.url.startsWith('/easydonate/')) return handleEasyDonate(req, res);
@@ -665,6 +688,27 @@ wss.on('connection', (ws, req) => {
     if (ws._scope === 'listener') return; // read-only: ทุกอย่างที่ listener ส่งมาถูกทิ้ง
     const msg = sanitize(parsed);
     if (!msg) return;
+
+    // Opt-in hardening (security.js). All modes default OFF => this block does nothing until env vars are set.
+    // csrf / pow are read from the RAW message (sanitize() deliberately drops unknown fields) and are never relayed.
+    const slog = (x) => console.warn(x + ' ch=' + ch + ' ip=' + (ws._ip || '?'));
+    if (ADMIN_TYPES.has(msg.t) && SEC.CFG.signed !== 'off') {
+      if (SEC.enforce('signed', SEC.CFG.signed, SEC.isSignedShape(msg.d) ? null : msg.t + ' has no valid sig/nonce/ts', slog)) return;
+    }
+    if (msg.t === 'donation' && ws._anon) {
+      const raw = (parsed.d && typeof parsed.d === 'object') ? parsed.d : {};
+      if (SEC.CFG.csrf !== 'off') {
+        if (SEC.enforce('csrf', SEC.CFG.csrf, SEC.checkCsrf(raw.csrf, ws._ip || '') ? null : 'missing/invalid csrf token', slog)) return;
+      }
+      if (SEC.CFG.powBits > 0) {
+        // the work is bound to the donation record the browser built (rec) plus the slip hash
+        const bound = Object.assign({}, raw.rec || {}); if (typeof raw.slip === 'string') bound.slip = raw.slip;
+        if (SEC.enforce('pow', SEC.CFG.powMode, SEC.checkPow(bound, raw.pow, SEC.CFG.powBits) ? null : 'missing/invalid proof-of-work', slog)) return;
+      }
+      if (SEC.CFG.strict !== 'off') {
+        if (SEC.enforce('strict', SEC.CFG.strict, SEC.strictDonation(msg.d && msg.d.rec, { min: 1, max: 1000000 }), slog)) return;
+      }
+    }
 
     // Capability scope enforcement — no-op today while RELAY_TOKEN is unset (see above).
     if (ADMIN_TYPES.has(msg.t) && ws._scope !== 'admin') return; // drop เงียบ ไม่ relay ไม่ backlog

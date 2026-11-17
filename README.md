@@ -75,6 +75,31 @@ npm start
 # on the same network and try the donor → admin flow
 ```
 
+## Opt-in hardening (CSRF, proof-of-work, signed admin messages, strict donations)
+
+Everything below is **off by default**: deploying changes nothing until you set the env var. Each feature
+also has a `log` mode that counts what *would* be rejected (see `GET /health` -> `sec.hits`) without
+dropping anything, so you can watch real traffic before enforcing.
+
+| Env var | Values | What it does |
+|---|---|---|
+| `CSRF_MODE` | `0` / `log` / `1` | donations must carry a short-lived token from `GET /csrf` (bound to the donor's IP) |
+| `POW_BITS` | `0`-`24` (try `14`) | donations must carry a proof-of-work bound to the donation content. Each +1 doubles the work |
+| `POW_MODE` | `log` / `1` | `log` counts bad proofs but lets them through (default `1` once `POW_BITS` > 0) |
+| `STRICT_DONATION` | `0` / `log` / `1` | rejects links, control/bidi characters, stale timestamps, bad ids and odd decimals in donations |
+| `REQUIRE_SIGNED` | `0` / `log` / `1` | `alert` / `cfg` / `resolved` must be shaped like a signed message (`sig` + `nonce` + `ts`) |
+| `CSRF_SECRET` | long random string | HMAC key for CSRF tokens. Unset = random per boot, so tokens die on every restart |
+
+The relay holds **no signing key and never verifies a signature**: the overlay and donor page do that.
+`REQUIRE_SIGNED` only stops messages that are not even shaped like a signed message.
+
+**The donate page must send the proof before you turn CSRF/PoW on**, or real donations will be dropped.
+`client/donate-security.js` does this: `const sec = await DonateSecurity.prepare(API, rec, slip, await DonateSecurity.difficulty(API))`
+then send `{t:'donation', d:{rec, slip, ...sec}}`. It returns `{}` if the relay is unreachable, so the form never breaks.
+
+Safe rollout: (1) deploy with nothing set, (2) update the donate page to send `sec`, (3) set the features to `log`,
+(4) check `/health` -> `sec.hits` stays near zero for real donors, (5) switch to `1`.
+
 ## How it works (so you can trust/debug it)
 
 - The HTML app already builds every donation/approval/alert message with a

@@ -5,7 +5,7 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node test/relay.test.js && node test/ratelimit.test.js && node test/sigpass.test.js"
+    "test": "node test/relay.test.js && node test/ratelimit.test.js && node test/sigpass.test.js && node test/security.test.js && node test/client-contract.test.js"
   },
   "engines": {
     "node": ">=18"
